@@ -37,8 +37,8 @@ staging_team_role_arn = ""
 # who bootstrapped the cluster and needs kubectl/terraform k8s access.
 cluster_admin_principal_arns = []
 
-# Explicit CI-role cluster-admin. Pinned to the role the Bitbucket pipeline
-# assumes (CI_ROLE_ARN) so the CI access entry is STABLE regardless of who runs
+# Explicit CI-role cluster-admin. Pin this to the role GitHub Actions assumes
+# (CI_ROLE_ARN) so the CI access entry is STABLE regardless of who runs
 # `apply`. Leaving it empty auto-derives the entry from the *current* caller,
 # which means a local apply (as the SSO admin) never creates an entry for the CI
 # role — so CI fails k8s auth ("Unauthorized") when it reads existing resources.

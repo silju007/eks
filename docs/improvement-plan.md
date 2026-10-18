@@ -23,7 +23,7 @@ Each item is self-contained and can be handed to Claude Code individually, e.g.:
 - **Repo**: example-infra
 - **File**: `infra-terraform/projects/example-project/shared.tfvars` (`endpoint_public_access_cidrs`)
 - **Problem**: Currently `["0.0.0.0/0"]` — the Kubernetes API is reachable from any IP (auth still required, but attack surface is maximal).
-- **Fix**: Replace with office/VPN CIDRs + Bitbucket Pipelines egress IPs (see Atlassian's published IP ranges). Alternatively disable public access entirely and use the private endpoint via VPN.
+- **Fix**: Replace with office/VPN CIDRs plus the approved runner egress range. Alternatively disable public access entirely and use the private endpoint via VPN.
 - **Verify**: `aws eks describe-cluster --name example-project-shared --query 'cluster.resourcesVpcConfig.publicAccessCidrs'`
 
 ### 3. Switch Istio mTLS from PERMISSIVE to STRICT
@@ -79,7 +79,7 @@ Each item is self-contained and can be handed to Claude Code individually, e.g.:
 
 ### 10. Add Terraform linting/scanning to CI
 - **Repo**: example-infra
-- **Files**: `bitbucket-pipelines.yml`, `infra-terraform/Makefile`
+- **Files**: `.github/workflows/terraform.yml`, `infra-terraform/Makefile`
 - **Fix**: Add `terraform fmt -check`, `tflint`, and `checkov` (or `trivy config`) as a PR step before `plan`. Add a pre-commit config for local use.
 
 ### 11. Reduce Istio trace sampling

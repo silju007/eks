@@ -134,47 +134,26 @@ Under the hood each target runs `terraform -chdir=<root>` with
 and (for global/shared) `-backend-config=projects/<name>/backend.hcl`.
 Prefer raw Terraform? The commands the Makefile prints with `make -n` work standalone.
 
-## CI/CD (Bitbucket Pipelines)
+## CI/CD (GitHub Actions)
 
-`bitbucket-pipelines.yml` lives at the **repo root** (the infrastructure repository)
-— Bitbucket only runs the file from the repository root) and drives Terraform here
-via `make -C infra-terraform`. It manages `global` + `shared` only. **`bootstrap`
-is never run by CI** — it's a one-time, human-run step (it creates the state bucket, KMS,
-and the CI role the pipeline itself depends on). Auth is **OIDC** (no AWS keys in
-Bitbucket): each step exchanges its step token for the dedicated CI role
-via `AssumeRoleWithWebIdentity`.
+The canonical workflow is
+[`.github/workflows/terraform.yml`](../.github/workflows/terraform.yml). It
+manages `global` and `shared`; **`bootstrap` is never run by CI** because it is
+a one-time, human-operated foundation step.
 
-- **PR** → `terraform plan` (global + shared), read-only.
-- **Merge to `main`** → auto-apply `global`, then a **manual-gated** apply of
-  `shared` (global always first — `shared` reads global's state).
+- **Pull requests** run formatting, validation, security scans, and read-only
+  Terraform plans.
+- **Pushes to `main`** apply `global`, then `shared`.
+- **GitHub environments** named `global` and `shared` can require reviewers and
+  provide deployment history.
+- **AWS authentication** uses GitHub OIDC and short-lived role credentials;
+  no static AWS keys are stored in the repository.
 
-**One-time setup:**
-
-1. In `projects/<name>/bootstrap.tfvars`, set `bitbucket_workspace`,
-   `bitbucket_workspace_uuid`, `bitbucket_repo_uuid` (Bitbucket → *Repository
-   settings → OpenID Connect*), then re-run `make apply ROOT=bootstrap` to create
-   the OIDC provider + CI role. Grab the ARN with `make output ROOT=bootstrap`.
-2. Set **Repository variables** (*Repository settings → Repository variables*):
-   `PROJECT`, `AWS_REGION`, and `CI_ROLE_ARN` (the `ci_role_arn` output).
-3. Ensure `endpoint_public_access_cidrs` includes Bitbucket's egress IPs (or use
-   an in-VPC self-hosted runner) so the `shared` apply can reach the EKS API.
-
-### Deployment environments
-
-The `apply` steps reference two Bitbucket **Deployment environments**, `global`
-and `shared`. Create them under *Repository settings → Deployments*. They give you:
-
-- **Scoped variables** — e.g. a per-env `CI_ROLE_ARN` if global/shared live in
-  different accounts (overrides the repo-level variable for that step).
-- **Deployment gating & tracking** — restrict who can deploy each environment and
-  see a history of what applied when.
-
-Environment names must match the `deployment:` values in the YAML exactly. Order
-matters in the UI: put `shared` in the **Production** tier and `global` in
-**Staging/Test** so the promotion order reads correctly. The `shared` step also
-has `trigger: manual`, so it always waits for a click regardless of environment
-config — **if you don't want to use environments at all, just delete the two
-`deployment:` lines** and the manual gate still protects the cluster.
+Configure the workflow with repository variables `PROJECT` and `AWS_REGION`,
+secrets `CI_ROLE_ARN` and `GITOPS_SSH_PRIVATE_KEY`, and an AWS trust policy
+restricted to this repository and its intended branch/environment. The current
+bootstrap Terraform inputs retain legacy Bitbucket OIDC fields for compatibility;
+GitHub OIDC trust must be configured separately before using the GitHub workflow.
 
 ## Key variables (per project, in `projects/<name>/`)
 

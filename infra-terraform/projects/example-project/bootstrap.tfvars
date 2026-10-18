@@ -2,12 +2,12 @@
 
 # --- CI trust: plain AWS principals ------------------------------------------
 # IAM principals (users/roles) allowed to assume the CI plan/apply role.
-# Leave empty if you only use Bitbucket OIDC below.
+# Leave empty if you use OIDC below.
 ci_trusted_principal_arns = []
 
-# --- CI trust: Bitbucket Pipelines via OIDC ----------------------------------
-# Set these to let Bitbucket Pipelines assume the CI role with no stored AWS
-# keys. Find the workspace UUID + repo UUID in Repository settings ->
+# --- Legacy CI trust: Bitbucket Pipelines via OIDC ----------------------------
+# Set these only if the legacy Bitbucket pipeline is used. Find the workspace
+# UUID + repo UUID in Repository settings ->
 # OpenID Connect (the Audience is ari:cloud:bitbucket::workspace/<uuid>).
 # Leave bitbucket_workspace empty to skip OIDC entirely.
 bitbucket_workspace      = "" # e.g. "example-org"
