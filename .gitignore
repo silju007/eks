@@ -1,0 +1,24 @@
+# Terraform state, plans, providers, and local overrides
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Local credentials and generated key material
+.env
+.env.*
+*.pem
+*.key
+argocd_gitops
+argocd_gitops.pub
+
+# Local tooling and editor files
+.DS_Store
+.idea/
+.vscode/
