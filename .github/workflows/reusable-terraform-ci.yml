@@ -1,0 +1,205 @@
+name: Reusable Terraform CI
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Terraform project directory under infra-terraform/projects
+        required: true
+        type: string
+      aws_region:
+        description: AWS region used by Terraform plans
+        required: true
+        type: string
+      terraform_version:
+        description: Terraform CLI version
+        required: false
+        default: 1.9.8
+        type: string
+      run_plan:
+        description: Run authenticated global and shared plans
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      CI_ROLE_ARN:
+        required: false
+      GITOPS_SSH_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+jobs:
+  quality:
+    name: Format, validate, and security scans
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Check Terraform formatting
+        id: fmt
+        continue-on-error: true
+        working-directory: infra-terraform
+        run: terraform fmt -check -recursive
+
+      - name: Initialize Terraform roots without a backend
+        id: init
+        continue-on-error: true
+        working-directory: infra-terraform
+        run: |
+          terraform -chdir=bootstrap init -backend=false -input=false
+          terraform -chdir=global init -backend=false -input=false
+          terraform -chdir=environments/shared init -backend=false -input=false
+
+      - name: Validate Terraform roots
+        id: validate
+        continue-on-error: true
+        working-directory: infra-terraform
+        run: |
+          terraform -chdir=bootstrap validate
+          terraform -chdir=global validate
+          terraform -chdir=environments/shared validate
+
+      - name: Check Terraform with Checkov
+        id: checkov
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra-terraform
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-terraform.sarif
+          soft_fail: false
+
+      - name: Upload Terraform Checkov results
+        if: always() && hashFiles('checkov-terraform.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-terraform.sarif
+          category: checkov-terraform
+
+      - name: Check GitHub Actions with Checkov
+        id: checkov_actions
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .github/workflows
+          framework: github_actions
+          output_format: sarif
+          output_file_path: checkov-actions.sarif
+          soft_fail: false
+
+      - name: Upload GitHub Actions Checkov results
+        if: always() && hashFiles('checkov-actions.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-actions.sarif
+          category: checkov-github-actions
+
+      - name: Scan repository configuration with Trivy
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: misconfig,secret
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Upload Trivy results
+        if: always() && hashFiles('trivy-results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-filesystem
+
+      - name: Scan Git history for secrets
+        id: gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enforce quality and security gate
+        if: always()
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          CHECKOV_OUTCOME: ${{ steps.checkov.outcome }}
+          CHECKOV_ACTIONS_OUTCOME: ${{ steps.checkov_actions.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+        run: |
+          failed=0
+          for result in "$FMT_OUTCOME" "$INIT_OUTCOME" "$VALIDATE_OUTCOME" \
+            "$CHECKOV_OUTCOME" "$CHECKOV_ACTIONS_OUTCOME" "$TRIVY_OUTCOME" "$GITLEAKS_OUTCOME"; do
+            if [ "$result" != success ]; then
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  plan:
+    name: Terraform plan (global + shared)
+    if: inputs.run_plan
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-plan
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Decode ArgoCD repository key
+        env:
+          GITOPS_SSH_PRIVATE_KEY_B64: ${{ secrets.GITOPS_SSH_PRIVATE_KEY }}
+        run: |
+          {
+            echo 'TF_VAR_gitops_ssh_private_key<<GITOPS_SSH_PRIVATE_KEY_EOF'
+            if [ -n "$GITOPS_SSH_PRIVATE_KEY_B64" ]; then
+              printf '%s' "$GITOPS_SSH_PRIVATE_KEY_B64" | base64 --decode
+            fi
+            echo 'GITOPS_SSH_PRIVATE_KEY_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Plan global
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          make -C infra-terraform init PROJECT="$PROJECT" ROOT=global
+          make -C infra-terraform plan PROJECT="$PROJECT" ROOT=global EXTRA='-var=aws_profile='
+
+      - name: Plan shared
+        env:
+          PROJECT: ${{ inputs.project }}
+        run: |
+          make -C infra-terraform init PROJECT="$PROJECT" ROOT=shared
+          make -C infra-terraform plan PROJECT="$PROJECT" ROOT=shared EXTRA='-var=aws_profile='
