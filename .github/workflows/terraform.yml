@@ -1,0 +1,295 @@
+name: Terraform infrastructure
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Optional manually dispatched action
+        required: true
+        default: plan
+        type: choice
+        options:
+          - plan
+          - build-ci-image
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  PROJECT: ${{ vars.PROJECT }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_VERSION: 1.9.8
+
+jobs:
+  security:
+    name: Quality and security gate
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install CI tools
+        run: bash ci/install-tools.sh
+
+      - name: Check Terraform formatting
+        id: fmt
+        continue-on-error: true
+        working-directory: infra-terraform
+        run: terraform fmt -check -recursive
+
+      - name: Initialize Terraform roots without a backend
+        id: init
+        continue-on-error: true
+        working-directory: infra-terraform
+        run: |
+          terraform -chdir=bootstrap init -backend=false -input=false
+          terraform -chdir=global init -backend=false -input=false
+          terraform -chdir=environments/shared init -backend=false -input=false
+
+      - name: Validate Terraform roots
+        id: validate
+        continue-on-error: true
+        working-directory: infra-terraform
+        run: |
+          terraform -chdir=bootstrap validate
+          terraform -chdir=global validate
+          terraform -chdir=environments/shared validate
+
+      - name: Check Terraform with Checkov
+        id: checkov
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: infra-terraform
+          framework: terraform
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: false
+
+      - name: Upload Checkov results
+        if: always() && hashFiles('checkov-results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov-terraform
+
+      - name: Check GitHub Actions workflow with Checkov
+        id: checkov_actions
+        continue-on-error: true
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          file: .github/workflows/terraform.yml
+          framework: github_actions
+          output_format: sarif
+          output_file_path: checkov-actions-results.sarif
+          soft_fail: false
+
+      - name: Upload Checkov workflow results
+        if: always() && hashFiles('checkov-actions-results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: checkov-actions-results.sarif
+          category: checkov-github-actions
+
+      - name: Scan repository configuration with Trivy
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: misconfig,secret
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      - name: Upload Trivy results
+        if: always() && hashFiles('trivy-results.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-filesystem
+
+      - name: Scan git history for secrets
+        id: gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enforce quality and security gate
+        if: always()
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          INIT_OUTCOME: ${{ steps.init.outcome }}
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          CHECKOV_OUTCOME: ${{ steps.checkov.outcome }}
+          CHECKOV_ACTIONS_OUTCOME: ${{ steps.checkov_actions.outcome }}
+          TRIVY_OUTCOME: ${{ steps.trivy.outcome }}
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+        run: |
+          failed=0
+          for result in "$FMT_OUTCOME" "$INIT_OUTCOME" "$VALIDATE_OUTCOME" \
+            "$CHECKOV_OUTCOME" "$TRIVY_OUTCOME" "$GITLEAKS_OUTCOME"; do
+            if [ "$result" != success ]; then
+              failed=1
+            fi
+          done
+          if [ "$CHECKOV_ACTIONS_OUTCOME" != success ]; then
+            failed=1
+          fi
+          exit "$failed"
+
+  plan:
+    name: Terraform plan (global + shared)
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false) || (github.event_name == 'workflow_dispatch' && inputs.action == 'plan')
+    needs: security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install CI tools
+        run: bash ci/install-tools.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Decode ArgoCD repository key
+        env:
+          GITOPS_SSH_PRIVATE_KEY_B64: ${{ secrets.GITOPS_SSH_PRIVATE_KEY }}
+        run: |
+          {
+            echo 'TF_VAR_gitops_ssh_private_key<<GITOPS_SSH_PRIVATE_KEY_EOF'
+            if [ -n "$GITOPS_SSH_PRIVATE_KEY_B64" ]; then
+              printf '%s' "$GITOPS_SSH_PRIVATE_KEY_B64" | base64 --decode
+            fi
+            echo 'GITOPS_SSH_PRIVATE_KEY_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Plan global
+        run: |
+          make -C infra-terraform init PROJECT="$PROJECT" ROOT=global
+          make -C infra-terraform plan PROJECT="$PROJECT" ROOT=global EXTRA='-var=aws_profile='
+
+      - name: Plan shared
+        run: |
+          make -C infra-terraform init PROJECT="$PROJECT" ROOT=shared
+          make -C infra-terraform plan PROJECT="$PROJECT" ROOT=shared EXTRA='-var=aws_profile='
+
+  apply-global:
+    name: Apply global (ECR / Route53 / KMS)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: security
+    runs-on: ubuntu-latest
+    environment: global
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install CI tools
+        run: bash ci/install-tools.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-global
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Apply global
+        run: |
+          make -C infra-terraform init PROJECT="$PROJECT" ROOT=global
+          make -C infra-terraform apply PROJECT="$PROJECT" ROOT=global AUTO=1 EXTRA='-var=aws_profile='
+
+  apply-shared:
+    name: Apply shared (EKS cluster + ArgoCD)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: apply-global
+    runs-on: ubuntu-latest
+    environment: shared
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install CI tools
+        run: bash ci/install-tools.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-shared
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Decode ArgoCD repository key
+        env:
+          GITOPS_SSH_PRIVATE_KEY_B64: ${{ secrets.GITOPS_SSH_PRIVATE_KEY }}
+        run: |
+          {
+            echo 'TF_VAR_gitops_ssh_private_key<<GITOPS_SSH_PRIVATE_KEY_EOF'
+            if [ -n "$GITOPS_SSH_PRIVATE_KEY_B64" ]; then
+              printf '%s' "$GITOPS_SSH_PRIVATE_KEY_B64" | base64 --decode
+            fi
+            echo 'GITOPS_SSH_PRIVATE_KEY_EOF'
+          } >> "$GITHUB_ENV"
+
+      - name: Apply shared
+        run: |
+          make -C infra-terraform init PROJECT="$PROJECT" ROOT=shared
+          make -C infra-terraform apply PROJECT="$PROJECT" ROOT=shared AUTO=1 EXTRA='-var=aws_profile='
+
+  build-ci-image:
+    name: Build and push CI image to ECR
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'build-ci-image'
+    needs: security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install CI tools
+        run: bash ci/install-tools.sh
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.CI_ROLE_ARN }}
+          role-session-name: gha-${{ github.run_id }}-build
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Build and push image
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE="${REGISTRY}/${PROJECT}-ci:latest"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+          docker build -t "$IMAGE" -f ci/Dockerfile ci
+          docker push "$IMAGE"
+          echo "Pushed $IMAGE"
